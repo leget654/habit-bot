@@ -466,6 +466,36 @@ async def cmd_start(msg: Message):
 async def cmd_menu_msg(msg: Message):
     await msg.answer("Меню:", reply_markup=main_menu_kb())
 
+@dp.message(Command("reset"))
+async def cmd_reset(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("✅ Готово! Можешь пользоваться ботом.", reply_markup=main_reply_kb())
+
+# Catch-all: if user sends text while in unknown state — reset it
+@dp.message(F.text & ~F.text.startswith("/"))
+async def catch_all_text(msg: Message, state: FSMContext):
+    current = await state.get_state()
+    # Only handle if not in a known FSM state
+    known_states = [
+        AddHabit.waiting_name, AddHabit.waiting_emoji, AddHabit.waiting_time, AddHabit.waiting_goal,
+        SetGoal.waiting_days, RenameHabit.waiting_new_name, AddNote.waiting_note, SetUsername.waiting_name
+    ]
+    if current not in [s.state for s in known_states]:
+        # Route reply keyboard buttons
+        text = msg.text
+        if text == "📋 Привычки":
+            await reply_habits(msg)
+        elif text == "📊 Статистика":
+            await reply_stats(msg)
+        elif text == "🏆 Рейтинг":
+            await reply_leaderboard(msg)
+        elif text == "👤 Мой профиль":
+            await reply_profile(msg)
+        elif text == "➕ Добавить":
+            await reply_add(msg, state)
+        elif text == "⚙️ Управление":
+            await reply_manage(msg)
+
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
     await cb.message.edit_text("Главное меню:", reply_markup=main_menu_kb())
