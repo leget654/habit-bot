@@ -6,7 +6,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,8 +24,7 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-
-# ── Achievements ──────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 ACHIEVEMENTS = [
     {"id": "streak_3",   "streak": 3,   "icon": "🥉", "title": "3 дня подряд",    "desc": "Хорошее начало!"},
@@ -34,6 +34,42 @@ ACHIEVEMENTS = [
     {"id": "streak_60",  "streak": 60,  "icon": "💎", "title": "60 дней подряд",  "desc": "Легенда!"},
     {"id": "streak_100", "streak": 100, "icon": "🚀", "title": "100 дней подряд", "desc": "Невероятно!"},
 ]
+
+LEVELS = [
+    (0,    "🌱 Новичок"),
+    (100,  "⚡ Ученик"),
+    (300,  "🔥 Практик"),
+    (700,  "💪 Мастер"),
+    (1500, "🏆 Чемпион"),
+    (3000, "💎 Легенда"),
+    (6000, "🚀 Бог привычек"),
+]
+
+STREAK_SERIES = [
+    (3,   "🔥 Серия 3 дня!",    "Разогреваешься!"),
+    (7,   "🔥🔥 Серия неделя!", "Ты в потоке!"),
+    (14,  "🔥🔥🔥 2 недели!",   "Машина привычек!"),
+    (30,  "💥 МЕСЯЦ подряд!",   "Ты легенда!"),
+    (100, "🚀 100 ДНЕЙ!",       "Просто невероятно!"),
+]
+
+XP_PER_HABIT = 10
+XP_STREAK_BONUS = 5  # per streak day
+
+
+def get_level(xp: int) -> tuple:
+    level_num = 0
+    level_name = LEVELS[0][1]
+    for i, (req, name) in enumerate(LEVELS):
+        if xp >= req:
+            level_num = i + 1
+            level_name = name
+    next_xp = None
+    for req, name in LEVELS:
+        if req > xp:
+            next_xp = req
+            break
+    return level_num, level_name, next_xp
 
 
 # ── FSM States ────────────────────────────────────────────────────────────────
@@ -53,11 +89,22 @@ class RenameHabit(StatesGroup):
 class AddNote(StatesGroup):
     waiting_note = State()
 
+class SetUsername(StatesGroup):
+    waiting_name = State()
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                display_name TEXT,
+                total_xp INTEGER DEFAULT 0,
+                created_at DATE DEFAULT CURRENT_DATE
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS habits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,19 +138,55 @@ async def init_db():
                 UNIQUE(habit_id, achievement_id)
             )
         """)
-        for col, definition in [
-            ("monthly_goal", "INTEGER DEFAULT NULL"),
-            ("is_paused", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE habits ADD COLUMN {col} {definition}")
-            except Exception:
-                pass
-        try:
-            await db.execute("ALTER TABLE completions ADD COLUMN note TEXT DEFAULT NULL")
-        except Exception:
-            pass
         await db.commit()
+
+
+async def ensure_user(user_id: int, first_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, display_name) VALUES (?, ?)",
+            (user_id, first_name)
+        )
+        await db.commit()
+
+
+async def add_xp(user_id: int, amount: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET total_xp = total_xp + ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        await db.commit()
+        async with db.execute("SELECT total_xp FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_user_xp(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT total_xp FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_leaderboard(limit: int = 10) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, display_name, total_xp FROM users ORDER BY total_xp DESC LIMIT ?",
+            (limit,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_user_rank(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE total_xp > (SELECT total_xp FROM users WHERE user_id=?)",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return (row[0] + 1) if row else 1
 
 
 async def get_habits(user_id: int, include_paused: bool = False) -> list:
@@ -111,11 +194,9 @@ async def get_habits(user_id: int, include_paused: bool = False) -> list:
         db.row_factory = aiosqlite.Row
         if include_paused:
             sql = "SELECT * FROM habits WHERE user_id=? AND is_active=1 ORDER BY id"
-            params = (user_id,)
         else:
             sql = "SELECT * FROM habits WHERE user_id=? AND is_active=1 AND is_paused=0 ORDER BY id"
-            params = (user_id,)
-        async with db.execute(sql, params) as cur:
+        async with db.execute(sql, (user_id,)) as cur:
             return await cur.fetchall()
 
 
@@ -138,10 +219,7 @@ async def toggle_completion(user_id: int, habit_id: int) -> bool:
         ) as cur:
             existing = await cur.fetchone()
         if existing:
-            await db.execute(
-                "DELETE FROM completions WHERE habit_id=? AND completed_date=?",
-                (habit_id, today)
-            )
+            await db.execute("DELETE FROM completions WHERE habit_id=? AND completed_date=?", (habit_id, today))
             await db.commit()
             return False
         else:
@@ -255,23 +333,35 @@ async def get_user_achievements(user_id: int) -> list:
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
+def main_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Привычки"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="🏆 Рейтинг"), KeyboardButton(text="👤 Мой профиль")],
+            [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="⚙️ Управление")],
+        ],
+        resize_keyboard=True
+    )
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои привычки", callback_data="show_today")],
         [InlineKeyboardButton(text="➕ Добавить привычку", callback_data="add_habit")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")],
         [InlineKeyboardButton(text="📅 История за неделю", callback_data="show_week")],
-        [InlineKeyboardButton(text="🏆 Достижения", callback_data="show_achievements")],
-        [InlineKeyboardButton(text="🎯 Цели на месяц", callback_data="show_goals")],
+        [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="show_profile")],
         [InlineKeyboardButton(text="⚙️ Управление", callback_data="show_manage")],
     ])
 
 
 def manage_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Переименовать привычку", callback_data="rename_list")],
+        [InlineKeyboardButton(text="✏️ Переименовать", callback_data="rename_list")],
         [InlineKeyboardButton(text="⏸ Поставить на паузу", callback_data="pause_list")],
         [InlineKeyboardButton(text="▶️ Снять с паузы", callback_data="unpause_list")],
+        [InlineKeyboardButton(text="🎯 Цели на месяц", callback_data="show_goals")],
         [InlineKeyboardButton(text="🗑 Удалить привычку", callback_data="delete_list")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu")],
     ])
@@ -301,10 +391,6 @@ async def habit_select_kb(user_id: int, prefix: str, back: str = "show_manage", 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def delete_kb(user_id: int) -> InlineKeyboardMarkup:
-    return await habit_select_kb(user_id, "del_", include_paused=True)
-
-
 async def goals_kb(user_id: int) -> InlineKeyboardMarkup:
     habits = await get_habits(user_id, include_paused=True)
     buttons = []
@@ -314,7 +400,7 @@ async def goals_kb(user_id: int) -> InlineKeyboardMarkup:
             text=f"{h['emoji']} {h['name']} {goal_text}",
             callback_data=f"setgoal_{h['id']}"
         )])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -327,6 +413,20 @@ def progress_bar(percent: int, length: int = 10) -> str:
 
 def goal_progress_bar(completed: int, goal: int, length: int = 10) -> str:
     pct = min(completed / goal, 1.0) if goal else 0
+    filled = round(pct * length)
+    return "█" * filled + "░" * (length - filled)
+
+
+def xp_bar(xp: int, next_xp: int | None, length: int = 10) -> str:
+    if next_xp is None:
+        return "█" * length + " MAX"
+    prev_xp = 0
+    for req, _ in LEVELS:
+        if req <= xp:
+            prev_xp = req
+    span = next_xp - prev_xp
+    done = xp - prev_xp
+    pct = done / span if span else 1
     filled = round(pct * length)
     return "█" * filled + "░" * (length - filled)
 
@@ -346,24 +446,25 @@ def calendar_grid(dates: set, year: int, month: int) -> str:
     return "\n".join(lines)
 
 
-# ── Handlers: core ────────────────────────────────────────────────────────────
+def rank_medal(rank: int) -> str:
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}.")
+
+
+# ── Handlers: start & menu ────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
     await msg.answer(
         f"Привет, {msg.from_user.first_name}! 👋\n\n"
-        "Я помогу отслеживать привычки.\n"
-        "Отмечай каждый день — следи за стриками и достижениями! 🔥",
-        reply_markup=main_menu_kb()
+        "Отслеживай привычки, зарабатывай опыт ⚡ и поднимайся в рейтинге 🏆\n\n"
+        "Используй кнопки внизу 👇",
+        reply_markup=main_reply_kb()
     )
 
 @dp.message(Command("menu"))
-async def cmd_menu(msg: Message):
-    await msg.answer("Главное меню:", reply_markup=main_menu_kb())
-
-@dp.message(Command("week"))
-async def cmd_week(msg: Message):
-    await _send_week(msg.from_user.id, msg)
+async def cmd_menu_msg(msg: Message):
+    await msg.answer("Меню:", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
@@ -371,13 +472,59 @@ async def cb_menu(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "show_manage")
 async def cb_show_manage(cb: CallbackQuery):
-    await cb.message.edit_text("⚙️ <b>Управление привычками</b>", reply_markup=manage_kb(), parse_mode="HTML")
+    await cb.message.edit_text("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
 
 
-# ── Today ─────────────────────────────────────────────────────────────────────
+# ── Reply keyboard routing ────────────────────────────────────────────────────
+
+@dp.message(F.text == "📋 Привычки")
+async def reply_habits(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    habits = await get_habits(msg.from_user.id)
+    if not habits:
+        await msg.answer("Нет привычек. Нажми ➕ Добавить!", reply_markup=main_reply_kb())
+        return
+    today_str = date.today().strftime("%d %B %Y")
+    await msg.answer(
+        f"📋 <b>{today_str}</b>\n\nОтметь выполненные:",
+        reply_markup=await today_kb(msg.from_user.id),
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📊 Статистика")
+async def reply_stats(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await _send_stats(msg.from_user.id, msg)
+
+@dp.message(F.text == "🏆 Рейтинг")
+async def reply_leaderboard(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await _send_leaderboard(msg.from_user.id, msg)
+
+@dp.message(F.text == "👤 Мой профиль")
+async def reply_profile(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await _send_profile(msg.from_user.id, msg)
+
+@dp.message(F.text == "➕ Добавить")
+async def reply_add(msg: Message, state: FSMContext):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await state.set_state(AddHabit.waiting_name)
+    await msg.answer(
+        "➕ <b>Новая привычка</b>\n\nКак называется?\n<i>Например: Зарядка, Читать, Пить воду</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "⚙️ Управление")
+async def reply_manage(msg: Message):
+    await msg.answer("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
+
+
+# ── Today / toggle ────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "show_today")
 async def cb_show_today(cb: CallbackQuery):
+    await ensure_user(cb.from_user.id, cb.from_user.first_name)
     habits = await get_habits(cb.from_user.id)
     if not habits:
         await cb.answer("Сначала добавь привычки!", show_alert=True)
@@ -402,22 +549,51 @@ async def cb_toggle(cb: CallbackQuery, state: FSMContext):
 
     if is_done:
         streak = await get_streak(habit_id)
+        # XP
+        xp_earned = XP_PER_HABIT + streak * XP_STREAK_BONUS
+        old_xp = await get_user_xp(cb.from_user.id)
+        new_xp = await add_xp(cb.from_user.id, xp_earned)
+        old_level = get_level(old_xp)[0]
+        new_level_num, new_level_name, next_xp = get_level(new_xp)
+
+        # Achievements
         new_achs = await check_and_grant_achievements(cb.from_user.id, habit_id, streak)
-        streak_text = f" 🔥 {streak}" if streak > 1 else ""
-        await cb.answer(f"✅ {habit['emoji']} {habit['name']}{streak_text}", show_alert=False)
+
+        streak_text = f" 🔥{streak}" if streak > 1 else ""
+        await cb.answer(f"✅ +{xp_earned}⚡{streak_text}", show_alert=False)
+
+        # Level up notification
+        if new_level_num > old_level:
+            await bot.send_message(
+                cb.from_user.id,
+                f"🎉 <b>Новый уровень!</b>\n\n{new_level_name}\n\nПродолжай в том же духе!",
+                parse_mode="HTML"
+            )
+
+        # Achievement notifications
         for ach in new_achs:
             await bot.send_message(
                 cb.from_user.id,
-                f"🎉 <b>Новое достижение!</b>\n\n{ach['icon']} <b>{ach['title']}</b>\n"
+                f"🏅 <b>Новое достижение!</b>\n\n{ach['icon']} <b>{ach['title']}</b>\n"
                 f"{habit['emoji']} {habit['name']}\n\n<i>{ach['desc']}</i>",
                 parse_mode="HTML"
             )
+
+        # Streak series notification
+        for days, title, subtitle in STREAK_SERIES:
+            if streak == days:
+                await bot.send_message(
+                    cb.from_user.id,
+                    f"{title}\n{habit['emoji']} {habit['name']}\n\n<i>{subtitle}</i>",
+                    parse_mode="HTML"
+                )
+
         # Ask for note
         await state.set_state(AddNote.waiting_note)
         await state.update_data(habit_id=habit_id)
         await bot.send_message(
             cb.from_user.id,
-            f"📝 Добавить заметку к <b>{habit['emoji']} {habit['name']}</b>? (или /skip)",
+            f"📝 Заметка к <b>{habit['emoji']} {habit['name']}</b>? (или /skip)",
             parse_mode="HTML"
         )
     else:
@@ -427,7 +603,7 @@ async def cb_toggle(cb: CallbackQuery, state: FSMContext):
     habits = await get_habits(cb.from_user.id)
     today_str = date.today().strftime("%d %B %Y")
     all_done = len(done) == len(habits) and len(habits) > 0
-    header = f"🎉 <b>{today_str}</b>\n\nВсе привычки выполнены!" if all_done else f"📋 <b>{today_str}</b>\n\nОтметь выполненные:"
+    header = f"🎉 <b>{today_str}</b>\n\nВсе выполнено!" if all_done else f"📋 <b>{today_str}</b>\n\nОтметь выполненные:"
     await cb.message.edit_text(header, reply_markup=await today_kb(cb.from_user.id), parse_mode="HTML")
 
 
@@ -436,7 +612,7 @@ async def cb_toggle(cb: CallbackQuery, state: FSMContext):
 @dp.message(Command("skip"), AddNote.waiting_note)
 async def cmd_skip_note(msg: Message, state: FSMContext):
     await state.clear()
-    await msg.answer("Окей, без заметки 👍")
+    await msg.answer("Окей 👍", reply_markup=main_reply_kb())
 
 @dp.message(AddNote.waiting_note)
 async def fsm_note(msg: Message, state: FSMContext):
@@ -449,7 +625,7 @@ async def fsm_note(msg: Message, state: FSMContext):
         )
         await db.commit()
     await state.clear()
-    await msg.answer("📝 Заметка сохранена!")
+    await msg.answer("📝 Заметка сохранена!", reply_markup=main_reply_kb())
 
 
 # ── Add habit ─────────────────────────────────────────────────────────────────
@@ -466,22 +642,19 @@ async def cb_add_habit(cb: CallbackQuery, state: FSMContext):
 async def fsm_habit_name(msg: Message, state: FSMContext):
     await state.update_data(name=msg.text.strip())
     await state.set_state(AddHabit.waiting_emoji)
-    await msg.answer(
-        "Выбери эмодзи:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💪", callback_data="emoji_💪"),
-             InlineKeyboardButton(text="🏃", callback_data="emoji_🏃"),
-             InlineKeyboardButton(text="📚", callback_data="emoji_📚"),
-             InlineKeyboardButton(text="💧", callback_data="emoji_💧"),
-             InlineKeyboardButton(text="🧘", callback_data="emoji_🧘")],
-            [InlineKeyboardButton(text="🥗", callback_data="emoji_🥗"),
-             InlineKeyboardButton(text="😴", callback_data="emoji_😴"),
-             InlineKeyboardButton(text="🎯", callback_data="emoji_🎯"),
-             InlineKeyboardButton(text="✍️", callback_data="emoji_✍️"),
-             InlineKeyboardButton(text="🎵", callback_data="emoji_🎵")],
-            [InlineKeyboardButton(text="✅ Без эмодзи", callback_data="emoji_✅")],
-        ])
-    )
+    await msg.answer("Выбери эмодзи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💪", callback_data="emoji_💪"),
+         InlineKeyboardButton(text="🏃", callback_data="emoji_🏃"),
+         InlineKeyboardButton(text="📚", callback_data="emoji_📚"),
+         InlineKeyboardButton(text="💧", callback_data="emoji_💧"),
+         InlineKeyboardButton(text="🧘", callback_data="emoji_🧘")],
+        [InlineKeyboardButton(text="🥗", callback_data="emoji_🥗"),
+         InlineKeyboardButton(text="😴", callback_data="emoji_😴"),
+         InlineKeyboardButton(text="🎯", callback_data="emoji_🎯"),
+         InlineKeyboardButton(text="✍️", callback_data="emoji_✍️"),
+         InlineKeyboardButton(text="🎵", callback_data="emoji_🎵")],
+        [InlineKeyboardButton(text="✅ Без эмодзи", callback_data="emoji_✅")],
+    ]))
 
 @dp.callback_query(F.data.startswith("emoji_"), AddHabit.waiting_emoji)
 async def fsm_emoji_cb(cb: CallbackQuery, state: FSMContext):
@@ -504,7 +677,7 @@ async def _ask_remind_time(target, state: FSMContext):
          InlineKeyboardButton(text="22:00", callback_data="time_22:00")],
         [InlineKeyboardButton(text="🔕 Без напоминания", callback_data="time_none")],
     ])
-    text = "🔔 Когда напоминать?\n\nВыбери или напиши в формате <code>ЧЧ:ММ</code>"
+    text = "🔔 Когда напоминать?\n\nВыбери или напиши <code>ЧЧ:ММ</code>"
     if hasattr(target, 'edit_text'):
         await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -535,7 +708,7 @@ async def _ask_goal(target, state: FSMContext):
          InlineKeyboardButton(text="10 дней", callback_data="goal_10")],
         [InlineKeyboardButton(text="Без цели", callback_data="goal_none")],
     ])
-    text = "🎯 <b>Цель на этот месяц</b>\n\nСколько дней хочешь выполнять привычку?"
+    text = "🎯 <b>Цель на месяц</b>\n\nСколько дней хочешь выполнять привычку?"
     if hasattr(target, 'edit_text'):
         await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -572,9 +745,8 @@ async def _save_habit(source, state: FSMContext):
     remind_text = f"⏰ {data.get('remind_time')}" if data.get("remind_time") else "🔕 Без напоминания"
     goal_text = f"🎯 Цель: {data['monthly_goal']} дней" if data.get("monthly_goal") else "🎯 Без цели"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 К привычкам на сегодня", callback_data="show_today")],
+        [InlineKeyboardButton(text="📋 К привычкам", callback_data="show_today")],
         [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="add_habit")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
     ])
     text = f"✅ <b>Привычка добавлена!</b>\n\n{data['emoji']} {data['name']}\n{remind_text}\n{goal_text}"
     if hasattr(source, 'message'):
@@ -583,125 +755,102 @@ async def _save_habit(source, state: FSMContext):
         await source.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-# ── Rename ────────────────────────────────────────────────────────────────────
+# ── Profile ───────────────────────────────────────────────────────────────────
 
-@dp.callback_query(F.data == "rename_list")
-async def cb_rename_list(cb: CallbackQuery):
-    kb = await habit_select_kb(cb.from_user.id, "rename_", include_paused=True)
-    await cb.message.edit_text("✏️ Выбери привычку для переименования:", reply_markup=kb)
+async def _send_profile(user_id: int, target):
+    xp = await get_user_xp(user_id)
+    rank = await get_user_rank(user_id)
+    level_num, level_name, next_xp = get_level(xp)
+    bar = xp_bar(xp, next_xp)
+    achs = await get_user_achievements(user_id)
+    habits = await get_habits(user_id)
 
-@dp.callback_query(F.data.startswith("rename_"))
-async def cb_rename_pick(cb: CallbackQuery, state: FSMContext):
-    habit_id = int(cb.data.split("_")[1])
-    await state.set_state(RenameHabit.waiting_new_name)
-    await state.update_data(habit_id=habit_id)
+    next_text = f"{next_xp - xp} ⚡ до следующего уровня" if next_xp else "Максимальный уровень!"
+
+    lines = [
+        f"👤 <b>Мой профиль</b>\n",
+        f"{level_name}  •  Уровень {level_num}",
+        f"⚡ {xp} XP  •  {rank_medal(rank)} #{rank} в рейтинге",
+        f"<code>{bar}</code>  {next_text}\n",
+        f"📌 Привычек: {len(habits)}",
+        f"🏅 Достижений: {len(achs)}",
+    ]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить имя в рейтинге", callback_data="set_username")],
+        [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
+        [InlineKeyboardButton(text="🏅 Достижения", callback_data="show_achievements")],
+    ])
+    text = "\n".join(lines)
+    if hasattr(target, 'edit_text'):
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "show_profile")
+async def cb_show_profile(cb: CallbackQuery):
+    await ensure_user(cb.from_user.id, cb.from_user.first_name)
+    await _send_profile(cb.from_user.id, cb.message)
+
+@dp.callback_query(F.data == "set_username")
+async def cb_set_username(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SetUsername.waiting_name)
+    await cb.message.edit_text("✏️ Напиши имя которое будет отображаться в рейтинге:")
+
+@dp.message(SetUsername.waiting_name)
+async def fsm_set_username(msg: Message, state: FSMContext):
+    name = msg.text.strip()[:32]
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
-            h = await cur.fetchone()
-    await cb.message.edit_text(
-        f"✏️ Текущее название: <b>{h['emoji']} {h['name']}</b>\n\nНапиши новое название:",
-        parse_mode="HTML"
-    )
-
-@dp.message(RenameHabit.waiting_new_name)
-async def fsm_rename(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    new_name = msg.text.strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE habits SET name=? WHERE id=?", (new_name, data["habit_id"]))
+        await db.execute("UPDATE users SET display_name=? WHERE user_id=?", (name, msg.from_user.id))
         await db.commit()
     await state.clear()
-    await msg.answer(f"✅ Переименовано: <b>{new_name}</b>", reply_markup=manage_kb(), parse_mode="HTML")
+    await msg.answer(f"✅ Имя изменено на <b>{name}</b>", parse_mode="HTML", reply_markup=main_reply_kb())
 
 
-# ── Pause / Unpause ───────────────────────────────────────────────────────────
+# ── Leaderboard ───────────────────────────────────────────────────────────────
 
-@dp.callback_query(F.data == "pause_list")
-async def cb_pause_list(cb: CallbackQuery):
-    habits = await get_habits(cb.from_user.id)
-    active = [h for h in habits if not h["is_paused"]]
-    if not active:
-        await cb.answer("Нет активных привычек.", show_alert=True)
-        return
-    buttons = [[InlineKeyboardButton(
-        text=f"{h['emoji']} {h['name']}", callback_data=f"dopause_{h['id']}"
-    )] for h in active]
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
-    await cb.message.edit_text("⏸ Выбери привычку для паузы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+async def _send_leaderboard(user_id: int, target):
+    leaders = await get_leaderboard(10)
+    rank = await get_user_rank(user_id)
+    xp = await get_user_xp(user_id)
+    _, level_name, _ = get_level(xp)
 
-@dp.callback_query(F.data.startswith("dopause_"))
-async def cb_dopause(cb: CallbackQuery):
-    habit_id = int(cb.data.split("_")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
-            h = await cur.fetchone()
-        await db.execute("UPDATE habits SET is_paused=1 WHERE id=?", (habit_id,))
-        await db.commit()
-    await cb.answer(f"⏸ {h['emoji']} {h['name']} — на паузе")
-    await cb.message.edit_text("⚙️ <b>Управление привычками</b>", reply_markup=manage_kb(), parse_mode="HTML")
+    lines = ["🏆 <b>Таблица лидеров</b>\n"]
+    for i, row in enumerate(leaders, 1):
+        medal = rank_medal(i)
+        _, lv_name, _ = get_level(row["total_xp"])
+        name = row["display_name"] or "Аноним"
+        is_me = "← ты" if row["user_id"] == user_id else ""
+        lines.append(f"{medal} <b>{name}</b>  {lv_name}\n   ⚡ {row['total_xp']} XP  {is_me}")
 
-@dp.callback_query(F.data == "unpause_list")
-async def cb_unpause_list(cb: CallbackQuery):
-    habits = await get_habits(cb.from_user.id, include_paused=True)
-    paused = [h for h in habits if h["is_paused"]]
-    if not paused:
-        await cb.answer("Нет привычек на паузе.", show_alert=True)
-        return
-    buttons = [[InlineKeyboardButton(
-        text=f"{h['emoji']} {h['name']}", callback_data=f"dounpause_{h['id']}"
-    )] for h in paused]
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
-    await cb.message.edit_text("▶️ Выбери привычку для возобновления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    lines.append(f"\n📍 Твоё место: #{rank}  •  ⚡ {xp} XP  •  {level_name}")
 
-@dp.callback_query(F.data.startswith("dounpause_"))
-async def cb_dounpause(cb: CallbackQuery):
-    habit_id = int(cb.data.split("_")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
-            h = await cur.fetchone()
-        await db.execute("UPDATE habits SET is_paused=0 WHERE id=?", (habit_id,))
-        await db.commit()
-    await cb.answer(f"▶️ {h['emoji']} {h['name']} — возобновлена!")
-    await cb.message.edit_text("⚙️ <b>Управление привычками</b>", reply_markup=manage_kb(), parse_mode="HTML")
-
-
-# ── Delete ────────────────────────────────────────────────────────────────────
-
-@dp.callback_query(F.data == "delete_list")
-async def cb_delete_list(cb: CallbackQuery):
-    habits = await get_habits(cb.from_user.id, include_paused=True)
-    if not habits:
-        await cb.answer("Нет привычек для удаления.", show_alert=True)
-        return
-    await cb.message.edit_text("🗑 Выбери привычку для удаления:", reply_markup=await delete_kb(cb.from_user.id))
-
-@dp.callback_query(F.data.startswith("del_"))
-async def cb_delete(cb: CallbackQuery):
-    habit_id = int(cb.data.split("_")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
-            h = await cur.fetchone()
-        await db.execute("UPDATE habits SET is_active=0 WHERE id=?", (habit_id,))
-        await db.commit()
-    await cb.answer(f"Удалено: {h['emoji']} {h['name']}")
-    habits = await get_habits(cb.from_user.id, include_paused=True)
-    if not habits:
-        await cb.message.edit_text("Привычек не осталось.", reply_markup=main_menu_kb())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="show_profile")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="show_leaderboard")],
+    ])
+    text = "\n".join(lines)
+    if hasattr(target, 'edit_text'):
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await cb.message.edit_text("🗑 Выбери привычку для удаления:", reply_markup=await delete_kb(cb.from_user.id))
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "show_leaderboard")
+async def cb_show_leaderboard(cb: CallbackQuery):
+    await ensure_user(cb.from_user.id, cb.from_user.first_name)
+    await _send_leaderboard(cb.from_user.id, cb.message)
 
 
 # ── Statistics ────────────────────────────────────────────────────────────────
 
-@dp.callback_query(F.data == "show_stats")
-async def cb_show_stats(cb: CallbackQuery):
-    habits = await get_habits(cb.from_user.id)
+async def _send_stats(user_id: int, target):
+    habits = await get_habits(user_id)
     if not habits:
-        await cb.answer("Сначала добавь привычки!", show_alert=True)
+        text = "Нет привычек. Добавь первую!"
+        if hasattr(target, 'edit_text'):
+            await target.edit_text(text)
+        else:
+            await target.answer(text)
         return
     today = date.today()
     lines = [f"📊 <b>Статистика — {today.strftime('%B %Y')}</b>\n"]
@@ -719,7 +868,7 @@ async def cb_show_stats(cb: CallbackQuery):
         lines.append(
             f"{h['emoji']} <b>{h['name']}</b>\n"
             f"{goal_line}\n"
-            f"  {streak_icon} Стрик: {streak} дн. · Рекорд: {best} дн.\n"
+            f"  {streak_icon} Стрик: {streak}  •  Рекорд: {best}\n"
         )
     lines.append("📅 <b>Календари</b>")
     for h in habits:
@@ -728,11 +877,17 @@ async def cb_show_stats(cb: CallbackQuery):
         lines.append(f"\n{h['emoji']} {h['name']}\n<code>{cal}</code>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 История за неделю", callback_data="show_week")],
-        [InlineKeyboardButton(text="🏆 Достижения", callback_data="show_achievements")],
-        [InlineKeyboardButton(text="🎯 Цели на месяц", callback_data="show_goals")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
     ])
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    text = "\n".join(lines)
+    if hasattr(target, 'edit_text'):
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "show_stats")
+async def cb_show_stats(cb: CallbackQuery):
+    await _send_stats(cb.from_user.id, cb.message)
 
 
 # ── Week ──────────────────────────────────────────────────────────────────────
@@ -740,29 +895,25 @@ async def cb_show_stats(cb: CallbackQuery):
 async def _send_week(user_id: int, target):
     habits = await get_habits(user_id)
     if not habits:
-        text = "Сначала добавь привычки!"
+        text = "Нет привычек."
         if hasattr(target, 'edit_text'):
-            await target.edit_text(text, reply_markup=main_menu_kb())
+            await target.edit_text(text)
         else:
-            await target.answer(text, reply_markup=main_menu_kb())
+            await target.answer(text)
         return
-
     today = date.today()
     week_start = today - timedelta(days=today.weekday())
     days = [week_start + timedelta(days=i) for i in range(7)]
     day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-
-    header = "  " + " ".join(f"{day_names[i]:>2}" for i in range(7))
-    lines = [f"📅 <b>Неделя {week_start.strftime('%d.%m')} — {days[-1].strftime('%d.%m')}</b>\n", f"<code>{header}"]
-
+    header = "  " + " ".join(f"{d:>2}" for d in day_names)
+    lines = [f"📅 <b>Неделя {week_start.strftime('%d.%m')}–{days[-1].strftime('%d.%m')}</b>\n",
+             f"<code>{header}"]
     for h in habits:
         week_done = await get_week_completions(h["id"])
         row = f"{h['emoji']} "
         for d in days:
-            mark = "✅" if d.isoformat() in week_done else ("·· " if d > today else "❌ ")
-            row += mark
+            row += "✅" if d.isoformat() in week_done else ("·· " if d > today else "❌ ")
         lines.append(row)
-
     lines.append("</code>")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")],
@@ -774,6 +925,10 @@ async def _send_week(user_id: int, target):
     else:
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
+@dp.message(Command("week"))
+async def cmd_week(msg: Message):
+    await _send_week(msg.from_user.id, msg)
+
 @dp.callback_query(F.data == "show_week")
 async def cb_show_week(cb: CallbackQuery):
     await _send_week(cb.from_user.id, cb.message)
@@ -784,12 +939,9 @@ async def cb_show_week(cb: CallbackQuery):
 @dp.callback_query(F.data == "show_achievements")
 async def cb_show_achievements(cb: CallbackQuery):
     habits = await get_habits(cb.from_user.id)
-    if not habits:
-        await cb.answer("Сначала добавь привычки!", show_alert=True)
-        return
     earned = await get_user_achievements(cb.from_user.id)
     earned_ids = {(r["habit_id"], r["achievement_id"]) for r in earned}
-    lines = ["🏆 <b>Достижения</b>\n"]
+    lines = ["🏅 <b>Достижения</b>\n"]
     for h in habits:
         streak = await get_streak(h["id"])
         lines.append(f"{h['emoji']} <b>{h['name']}</b> — стрик: {streak} дн.")
@@ -797,13 +949,10 @@ async def cb_show_achievements(cb: CallbackQuery):
             if (h["id"], ach["id"]) in earned_ids:
                 lines.append(f"  {ach['icon']} {ach['title']}")
             else:
-                lines.append(f"  🔒 {ach['title']} (нужно {ach['streak']} дн.)")
+                lines.append(f"  🔒 {ach['title']} ({ach['streak']} дн.)")
         lines.append("")
-    if not earned:
-        lines.append("Пока нет достижений. Начни отмечать привычки каждый день! 💪")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="show_profile")],
     ])
     await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
@@ -814,7 +963,7 @@ async def cb_show_achievements(cb: CallbackQuery):
 async def cb_show_goals(cb: CallbackQuery):
     habits = await get_habits(cb.from_user.id)
     if not habits:
-        await cb.answer("Сначала добавь привычки!", show_alert=True)
+        await cb.answer("Нет привычек.", show_alert=True)
         return
     today = date.today()
     days_in_month = calendar.monthrange(today.year, today.month)[1]
@@ -827,18 +976,15 @@ async def cb_show_goals(cb: CallbackQuery):
             done = stats["completed"]
             remaining = max(goal - done, 0)
             bar = goal_progress_bar(done, goal)
-            if done >= goal:
-                status = "✅ Цель достигнута!"
-            elif remaining <= days_left:
-                status = f"📈 Осталось {remaining} дн. — успеваешь!"
-            else:
-                status = f"⚠️ Осталось {remaining} дн., но дней в месяце {days_left}"
+            status = "✅ Цель достигнута!" if done >= goal else (
+                f"📈 Осталось {remaining} дн." if remaining <= days_left else f"⚠️ Осталось {remaining} дн., дней в месяце: {days_left}"
+            )
             lines.append(f"{h['emoji']} <b>{h['name']}</b>\n  {bar} {done}/{goal}\n  {status}\n")
         else:
             lines.append(f"{h['emoji']} <b>{h['name']}</b>\n  Цель не установлена\n")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Изменить цели", callback_data="edit_goals")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")],
     ])
     await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
@@ -852,17 +998,14 @@ async def cb_setgoal(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SetGoal.waiting_days)
     await state.update_data(habit_id=habit_id)
     days_in_month = calendar.monthrange(date.today().year, date.today().month)[1]
-    await cb.message.edit_text(
-        "🎯 Сколько дней в этом месяце?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Каждый день ({days_in_month})", callback_data=f"newgoal_{days_in_month}")],
-            [InlineKeyboardButton(text="20", callback_data="newgoal_20"),
-             InlineKeyboardButton(text="15", callback_data="newgoal_15"),
-             InlineKeyboardButton(text="10", callback_data="newgoal_10")],
-            [InlineKeyboardButton(text="❌ Убрать цель", callback_data="newgoal_none")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="edit_goals")],
-        ])
-    )
+    await cb.message.edit_text("🎯 Сколько дней?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Каждый день ({days_in_month})", callback_data=f"newgoal_{days_in_month}")],
+        [InlineKeyboardButton(text="20", callback_data="newgoal_20"),
+         InlineKeyboardButton(text="15", callback_data="newgoal_15"),
+         InlineKeyboardButton(text="10", callback_data="newgoal_10")],
+        [InlineKeyboardButton(text="❌ Убрать цель", callback_data="newgoal_none")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="edit_goals")],
+    ]))
 
 @dp.callback_query(F.data.startswith("newgoal_"), SetGoal.waiting_days)
 async def cb_newgoal(cb: CallbackQuery, state: FSMContext):
@@ -876,21 +1019,105 @@ async def cb_newgoal(cb: CallbackQuery, state: FSMContext):
     await cb.answer(f"✅ {'Цель: ' + str(goal) + ' дней' if goal else 'Цель убрана'}")
     await cb.message.edit_text("🎯 Выбери привычку:", reply_markup=await goals_kb(cb.from_user.id))
 
-@dp.message(SetGoal.waiting_days)
-async def fsm_setgoal_text(msg: Message, state: FSMContext):
-    try:
-        goal = int(msg.text.strip())
-        if 1 <= goal <= 31:
-            data = await state.get_data()
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE habits SET monthly_goal=? WHERE id=?", (goal, data["habit_id"]))
-                await db.commit()
-            await state.clear()
-            await msg.answer(f"✅ Цель: {goal} дней!", reply_markup=main_menu_kb())
-        else:
-            await msg.answer("Введи число от 1 до 31.")
-    except ValueError:
-        await msg.answer("Введи число, например: 20")
+
+# ── Rename / Pause / Delete ───────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "rename_list")
+async def cb_rename_list(cb: CallbackQuery):
+    await cb.message.edit_text("✏️ Выбери привычку:", reply_markup=await habit_select_kb(cb.from_user.id, "rename_", include_paused=True))
+
+@dp.callback_query(F.data.startswith("rename_"))
+async def cb_rename_pick(cb: CallbackQuery, state: FSMContext):
+    habit_id = int(cb.data.split("_")[1])
+    await state.set_state(RenameHabit.waiting_new_name)
+    await state.update_data(habit_id=habit_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
+            h = await cur.fetchone()
+    await cb.message.edit_text(f"✏️ Сейчас: <b>{h['emoji']} {h['name']}</b>\n\nНапиши новое название:", parse_mode="HTML")
+
+@dp.message(RenameHabit.waiting_new_name)
+async def fsm_rename(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE habits SET name=? WHERE id=?", (msg.text.strip(), data["habit_id"]))
+        await db.commit()
+    await state.clear()
+    await msg.answer(f"✅ Переименовано: <b>{msg.text.strip()}</b>", parse_mode="HTML", reply_markup=main_reply_kb())
+
+@dp.callback_query(F.data == "pause_list")
+async def cb_pause_list(cb: CallbackQuery):
+    habits = [h for h in await get_habits(cb.from_user.id) if not h["is_paused"]]
+    if not habits:
+        await cb.answer("Нет активных привычек.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=f"{h['emoji']} {h['name']}", callback_data=f"dopause_{h['id']}")] for h in habits]
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
+    await cb.message.edit_text("⏸ Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("dopause_"))
+async def cb_dopause(cb: CallbackQuery):
+    habit_id = int(cb.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
+            h = await cur.fetchone()
+        await db.execute("UPDATE habits SET is_paused=1 WHERE id=?", (habit_id,))
+        await db.commit()
+    await cb.answer(f"⏸ На паузе: {h['emoji']} {h['name']}")
+    await cb.message.edit_text("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "unpause_list")
+async def cb_unpause_list(cb: CallbackQuery):
+    habits = await get_habits(cb.from_user.id, include_paused=True)
+    paused = [h for h in habits if h["is_paused"]]
+    if not paused:
+        await cb.answer("Нет привычек на паузе.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=f"{h['emoji']} {h['name']}", callback_data=f"dounpause_{h['id']}")] for h in paused]
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
+    await cb.message.edit_text("▶️ Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("dounpause_"))
+async def cb_dounpause(cb: CallbackQuery):
+    habit_id = int(cb.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
+            h = await cur.fetchone()
+        await db.execute("UPDATE habits SET is_paused=0 WHERE id=?", (habit_id,))
+        await db.commit()
+    await cb.answer(f"▶️ Возобновлена: {h['emoji']} {h['name']}")
+    await cb.message.edit_text("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "delete_list")
+async def cb_delete_list(cb: CallbackQuery):
+    habits = await get_habits(cb.from_user.id, include_paused=True)
+    if not habits:
+        await cb.answer("Нет привычек.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=f"🗑 {h['emoji']} {h['name']}", callback_data=f"del_{h['id']}")] for h in habits]
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
+    await cb.message.edit_text("🗑 Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("del_"))
+async def cb_delete(cb: CallbackQuery):
+    habit_id = int(cb.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT name, emoji FROM habits WHERE id=?", (habit_id,)) as cur:
+            h = await cur.fetchone()
+        await db.execute("UPDATE habits SET is_active=0 WHERE id=?", (habit_id,))
+        await db.commit()
+    await cb.answer(f"Удалено: {h['emoji']} {h['name']}")
+    habits = await get_habits(cb.from_user.id, include_paused=True)
+    if not habits:
+        await cb.message.edit_text("Привычек не осталось.", reply_markup=main_menu_kb())
+    else:
+        buttons = [[InlineKeyboardButton(text=f"🗑 {h['emoji']} {h['name']}", callback_data=f"del_{h['id']}")] for h in habits]
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
+        await cb.message.edit_text("🗑 Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 # ── Reminders + weekly report ─────────────────────────────────────────────────
@@ -901,7 +1128,10 @@ async def send_weekly_report(user_id: int):
         return
     today = date.today()
     week_start = today - timedelta(days=7)
-    lines = [f"📊 <b>Итог недели {week_start.strftime('%d.%m')}–{today.strftime('%d.%m')}</b>\n"]
+    rank = await get_user_rank(user_id)
+    xp = await get_user_xp(user_id)
+    _, level_name, _ = get_level(xp)
+    lines = [f"📊 <b>Итог недели</b>  •  {rank_medal(rank)} #{rank}  •  {level_name}\n"]
     for h in habits:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
@@ -911,7 +1141,7 @@ async def send_weekly_report(user_id: int):
                 count = (await cur.fetchone())[0]
         streak = await get_streak(h["id"])
         bar = progress_bar(round(count / 7 * 100))
-        lines.append(f"{h['emoji']} <b>{h['name']}</b>\n  {bar} {count}/7 дн. · 🔥 {streak}\n")
+        lines.append(f"{h['emoji']} <b>{h['name']}</b>\n  {bar} {count}/7  •  🔥 {streak}\n")
     try:
         await bot.send_message(user_id, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
@@ -922,7 +1152,6 @@ async def check_reminders():
     while True:
         now = datetime.now()
         now_str = now.strftime("%H:%M")
-        # Reminders
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -942,7 +1171,6 @@ async def check_reminders():
                                            reply_markup=await today_kb(user_id))
                 except Exception as e:
                     logger.warning(f"Reminder failed for {user_id}: {e}")
-        # Weekly report — Sunday at 21:00
         if now.weekday() == 6 and now_str == "21:00":
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute("SELECT DISTINCT user_id FROM habits WHERE is_active=1") as cur:
