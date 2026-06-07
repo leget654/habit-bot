@@ -3,14 +3,14 @@ import logging
 import calendar
 from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.fsm.storage.memory import MemoryStorage
 import aiosqlite
 import os
@@ -470,31 +470,6 @@ async def cmd_menu_msg(msg: Message):
 async def cmd_reset(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Готово! Можешь пользоваться ботом.", reply_markup=main_reply_kb())
-
-# Catch-all: if user sends text while in unknown state — reset it
-@dp.message(F.text & ~F.text.startswith("/"))
-async def catch_all_text(msg: Message, state: FSMContext):
-    current = await state.get_state()
-    # Only handle if not in a known FSM state
-    known_states = [
-        AddHabit.waiting_name, AddHabit.waiting_emoji, AddHabit.waiting_time, AddHabit.waiting_goal,
-        SetGoal.waiting_days, RenameHabit.waiting_new_name, AddNote.waiting_note, SetUsername.waiting_name
-    ]
-    if current not in [s.state for s in known_states]:
-        # Route reply keyboard buttons
-        text = msg.text
-        if text == "📋 Привычки":
-            await reply_habits(msg)
-        elif text == "📊 Статистика":
-            await reply_stats(msg)
-        elif text == "🏆 Рейтинг":
-            await reply_leaderboard(msg)
-        elif text == "👤 Мой профиль":
-            await reply_profile(msg)
-        elif text == "➕ Добавить":
-            await reply_add(msg, state)
-        elif text == "⚙️ Управление":
-            await reply_manage(msg)
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
@@ -1148,6 +1123,15 @@ async def cb_delete(cb: CallbackQuery):
         buttons = [[InlineKeyboardButton(text=f"🗑 {h['emoji']} {h['name']}", callback_data=f"del_{h['id']}")] for h in habits]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
         await cb.message.edit_text("🗑 Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+# Catch-all: only when no FSM state and no specific handler matched
+@dp.message(F.text & ~F.text.startswith("/"), StateFilter(default_state))
+async def catch_all_text(msg: Message):
+    await msg.answer(
+        "Используй кнопки меню ниже 👇",
+        reply_markup=main_reply_kb()
+    )
 
 
 # ── Reminders + weekly report ─────────────────────────────────────────────────
