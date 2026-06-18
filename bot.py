@@ -138,6 +138,20 @@ async def init_db():
                 UNIQUE(habit_id, achievement_id)
             )
         """)
+        # Migrations for old databases
+        migrations = [
+            ("habits", "monthly_goal", "INTEGER DEFAULT NULL"),
+            ("habits", "is_paused", "INTEGER DEFAULT 0"),
+            ("completions", "note", "TEXT DEFAULT NULL"),
+            ("users", "total_xp", "INTEGER DEFAULT 0"),
+            ("users", "display_name", "TEXT"),
+        ]
+        for table, col, definition in migrations:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+                await db.commit()
+            except Exception:
+                pass
         await db.commit()
 
 
