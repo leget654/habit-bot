@@ -731,10 +731,11 @@ async def _ask_goal(target, state: FSMContext):
 async def fsm_goal_cb(cb: CallbackQuery, state: FSMContext):
     current = await state.get_state()
     if current != AddHabit.waiting_goal.state:
-        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        await cb.answer("Сначала начни добавление привычки через кнопку Добавить.", show_alert=True)
         return
     val = cb.data.split("_", 1)[1]
-    await state.update_data(monthly_goal=int(val) if val != "none" else None)
+    goal = int(val) if val != "none" else None
+    await state.update_data(monthly_goal=goal)
     await _save_habit(cb, state)
 
 @dp.message(AddHabit.waiting_goal)
