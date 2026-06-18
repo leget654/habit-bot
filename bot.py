@@ -661,8 +661,12 @@ async def fsm_habit_name(msg: Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Без эмодзи", callback_data="emoji_✅")],
     ]))
 
-@dp.callback_query(F.data.startswith("emoji_"), AddHabit.waiting_emoji)
+@dp.callback_query(F.data.startswith("emoji_"))
 async def fsm_emoji_cb(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_emoji.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
     await state.update_data(emoji=cb.data.split("_", 1)[1])
     await _ask_remind_time(cb.message, state)
 
@@ -688,8 +692,12 @@ async def _ask_remind_time(target, state: FSMContext):
     else:
         await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("time_"), AddHabit.waiting_time)
+@dp.callback_query(F.data.startswith("time_"))
 async def fsm_time_cb(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_time.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
     val = cb.data.split("_", 1)[1]
     await state.update_data(remind_time=val if val != "none" else None)
     await _ask_goal(cb.message, state)
@@ -719,8 +727,12 @@ async def _ask_goal(target, state: FSMContext):
     else:
         await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("goal_"), AddHabit.waiting_goal)
+@dp.callback_query(F.data.startswith("goal_"))
 async def fsm_goal_cb(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_goal.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
     val = cb.data.split("_", 1)[1]
     await state.update_data(monthly_goal=int(val) if val != "none" else None)
     await _save_habit(cb, state)
@@ -1012,8 +1024,12 @@ async def cb_setgoal(cb: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="edit_goals")],
     ]))
 
-@dp.callback_query(F.data.startswith("newgoal_"), SetGoal.waiting_days)
+@dp.callback_query(F.data.startswith("newgoal_"))
 async def cb_newgoal(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != SetGoal.waiting_days.state:
+        await cb.answer("Сначала выбери привычку для изменения цели.", show_alert=True)
+        return
     data = await state.get_data()
     val = cb.data.split("_", 1)[1]
     goal = int(val) if val != "none" else None
