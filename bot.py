@@ -3,16 +3,15 @@ import logging
 import calendar
 from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup, default_state
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 import aiosqlite
 import os
 
@@ -24,18 +23,8 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-dp.callback_query.middleware(CallbackAnswerMiddleware())
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-REPLY_MENU_BUTTONS = {
-    "📋 Привычки",
-    "📊 Статистика",
-    "🏆 Рейтинг",
-    "👤 Мой профиль",
-    "➕ Добавить",
-    "⚙️ Управление",
-}
 
 ACHIEVEMENTS = [
     {"id": "streak_3",   "streak": 3,   "icon": "🥉", "title": "3 дня подряд",    "desc": "Хорошее начало!"},
@@ -476,7 +465,6 @@ async def cmd_start(msg: Message):
 @dp.message(Command("menu"))
 async def cmd_menu_msg(msg: Message):
     await msg.answer("Меню:", reply_markup=main_menu_kb())
-    await msg.answer("Или используй кнопки внизу 👇", reply_markup=main_reply_kb())
 
 @dp.message(Command("reset"))
 async def cmd_reset(msg: Message, state: FSMContext):
@@ -495,8 +483,7 @@ async def cb_show_manage(cb: CallbackQuery):
 # ── Reply keyboard routing ────────────────────────────────────────────────────
 
 @dp.message(F.text == "📋 Привычки")
-async def reply_habits(msg: Message, state: FSMContext):
-    await state.clear()
+async def reply_habits(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
     habits = await get_habits(msg.from_user.id)
     if not habits:
@@ -510,26 +497,22 @@ async def reply_habits(msg: Message, state: FSMContext):
     )
 
 @dp.message(F.text == "📊 Статистика")
-async def reply_stats(msg: Message, state: FSMContext):
-    await state.clear()
+async def reply_stats(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
     await _send_stats(msg.from_user.id, msg)
 
 @dp.message(F.text == "🏆 Рейтинг")
-async def reply_leaderboard(msg: Message, state: FSMContext):
-    await state.clear()
+async def reply_leaderboard(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
     await _send_leaderboard(msg.from_user.id, msg)
 
 @dp.message(F.text == "👤 Мой профиль")
-async def reply_profile(msg: Message, state: FSMContext):
-    await state.clear()
+async def reply_profile(msg: Message):
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
     await _send_profile(msg.from_user.id, msg)
 
 @dp.message(F.text == "➕ Добавить")
 async def reply_add(msg: Message, state: FSMContext):
-    await state.clear()
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
     await state.set_state(AddHabit.waiting_name)
     await msg.answer(
@@ -538,8 +521,7 @@ async def reply_add(msg: Message, state: FSMContext):
     )
 
 @dp.message(F.text == "⚙️ Управление")
-async def reply_manage(msg: Message, state: FSMContext):
-    await state.clear()
+async def reply_manage(msg: Message):
     await msg.answer("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
 
 
@@ -637,7 +619,7 @@ async def cmd_skip_note(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Окей 👍", reply_markup=main_reply_kb())
 
-@dp.message(AddNote.waiting_note, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(AddNote.waiting_note)
 async def fsm_note(msg: Message, state: FSMContext):
     data = await state.get_data()
     today = date.today().isoformat()
@@ -661,7 +643,7 @@ async def cb_add_habit(cb: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
-@dp.message(AddHabit.waiting_name, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(AddHabit.waiting_name)
 async def fsm_habit_name(msg: Message, state: FSMContext):
     await state.update_data(name=msg.text.strip())
     await state.set_state(AddHabit.waiting_emoji)
@@ -684,7 +666,7 @@ async def fsm_emoji_cb(cb: CallbackQuery, state: FSMContext):
     await state.update_data(emoji=cb.data.split("_", 1)[1])
     await _ask_remind_time(cb.message, state)
 
-@dp.message(AddHabit.waiting_emoji, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(AddHabit.waiting_emoji)
 async def fsm_emoji_text(msg: Message, state: FSMContext):
     await state.update_data(emoji=msg.text.strip())
     await _ask_remind_time(msg, state)
@@ -712,7 +694,7 @@ async def fsm_time_cb(cb: CallbackQuery, state: FSMContext):
     await state.update_data(remind_time=val if val != "none" else None)
     await _ask_goal(cb.message, state)
 
-@dp.message(AddHabit.waiting_time, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(AddHabit.waiting_time)
 async def fsm_time_text(msg: Message, state: FSMContext):
     try:
         datetime.strptime(msg.text.strip(), "%H:%M")
@@ -743,7 +725,7 @@ async def fsm_goal_cb(cb: CallbackQuery, state: FSMContext):
     await state.update_data(monthly_goal=int(val) if val != "none" else None)
     await _save_habit(cb, state)
 
-@dp.message(AddHabit.waiting_goal, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(AddHabit.waiting_goal)
 async def fsm_goal_text(msg: Message, state: FSMContext):
     try:
         goal = int(msg.text.strip())
@@ -820,7 +802,7 @@ async def cb_set_username(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SetUsername.waiting_name)
     await cb.message.edit_text("✏️ Напиши имя которое будет отображаться в рейтинге:")
 
-@dp.message(SetUsername.waiting_name, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(SetUsername.waiting_name)
 async def fsm_set_username(msg: Message, state: FSMContext):
     name = msg.text.strip()[:32]
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1012,8 +994,7 @@ async def cb_show_goals(cb: CallbackQuery):
     await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "edit_goals")
-async def cb_edit_goals(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def cb_edit_goals(cb: CallbackQuery):
     await cb.message.edit_text("🎯 Выбери привычку:", reply_markup=await goals_kb(cb.from_user.id))
 
 @dp.callback_query(F.data.startswith("setgoal_"))
@@ -1061,7 +1042,7 @@ async def cb_rename_pick(cb: CallbackQuery, state: FSMContext):
             h = await cur.fetchone()
     await cb.message.edit_text(f"✏️ Сейчас: <b>{h['emoji']} {h['name']}</b>\n\nНапиши новое название:", parse_mode="HTML")
 
-@dp.message(RenameHabit.waiting_new_name, ~F.text.in_(REPLY_MENU_BUTTONS))
+@dp.message(RenameHabit.waiting_new_name)
 async def fsm_rename(msg: Message, state: FSMContext):
     data = await state.get_data()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1142,15 +1123,6 @@ async def cb_delete(cb: CallbackQuery):
         buttons = [[InlineKeyboardButton(text=f"🗑 {h['emoji']} {h['name']}", callback_data=f"del_{h['id']}")] for h in habits]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_manage")])
         await cb.message.edit_text("🗑 Выбери привычку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-# Catch-all: only when no FSM state and no specific handler matched
-@dp.message(F.text & ~F.text.startswith("/"), StateFilter(default_state))
-async def catch_all_text(msg: Message):
-    await msg.answer(
-        "Используй кнопки меню ниже 👇",
-        reply_markup=main_reply_kb()
-    )
 
 
 # ── Reminders + weekly report ─────────────────────────────────────────────────
