@@ -683,10 +683,10 @@ async def _ask_remind_time(target, state: FSMContext):
         [InlineKeyboardButton(text="🔕 Без напоминания", callback_data="time_none")],
     ])
     text = "🔔 Когда напоминать?\n\nВыбери или напиши <code>ЧЧ:ММ</code>"
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("time_"), AddHabit.waiting_time)
 async def fsm_time_cb(cb: CallbackQuery, state: FSMContext):
@@ -714,10 +714,10 @@ async def _ask_goal(target, state: FSMContext):
         [InlineKeyboardButton(text="Без цели", callback_data="goal_none")],
     ])
     text = "🎯 <b>Цель на месяц</b>\n\nСколько дней хочешь выполнять привычку?"
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("goal_"), AddHabit.waiting_goal)
 async def fsm_goal_cb(cb: CallbackQuery, state: FSMContext):
@@ -787,10 +787,10 @@ async def _send_profile(user_id: int, target):
         [InlineKeyboardButton(text="🏅 Достижения", callback_data="show_achievements")],
     ])
     text = "\n".join(lines)
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "show_profile")
 async def cb_show_profile(cb: CallbackQuery):
@@ -835,10 +835,10 @@ async def _send_leaderboard(user_id: int, target):
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="show_leaderboard")],
     ])
     text = "\n".join(lines)
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "show_leaderboard")
 async def cb_show_leaderboard(cb: CallbackQuery):
@@ -852,10 +852,10 @@ async def _send_stats(user_id: int, target):
     habits = await get_habits(user_id)
     if not habits:
         text = "Нет привычек. Добавь первую!"
-        if hasattr(target, 'edit_text'):
-            await target.edit_text(text)
-        else:
+        if hasattr(target, 'message_id'):
             await target.answer(text)
+        else:
+            await target.edit_text(text)
         return
     today = date.today()
     lines = [f"📊 <b>Статистика — {today.strftime('%B %Y')}</b>\n"]
@@ -885,10 +885,10 @@ async def _send_stats(user_id: int, target):
         [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
     ])
     text = "\n".join(lines)
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "show_stats")
 async def cb_show_stats(cb: CallbackQuery):
@@ -901,10 +901,10 @@ async def _send_week(user_id: int, target):
     habits = await get_habits(user_id)
     if not habits:
         text = "Нет привычек."
-        if hasattr(target, 'edit_text'):
-            await target.edit_text(text)
-        else:
+        if hasattr(target, 'message_id'):
             await target.answer(text)
+        else:
+            await target.edit_text(text)
         return
     today = date.today()
     week_start = today - timedelta(days=today.weekday())
@@ -925,10 +925,10 @@ async def _send_week(user_id: int, target):
         [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
     ])
     text = "\n".join(lines)
-    if hasattr(target, 'edit_text'):
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
+    if hasattr(target, 'message_id'):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(Command("week"))
 async def cmd_week(msg: Message):
