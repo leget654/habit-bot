@@ -7,7 +7,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton,
+    WebAppInfo
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -17,6 +18,7 @@ import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "habits.db"
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -214,6 +216,16 @@ async def get_habits(user_id: int, include_paused: bool = False) -> list:
             return await cur.fetchall()
 
 
+async def create_habit(user_id: int, name: str, emoji: str = "✅", remind_time=None, monthly_goal=None):
+    """Simple habit creation used by the Mini App API."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO habits (user_id, name, emoji, remind_time, monthly_goal) VALUES (?,?,?,?,?)",
+            (user_id, name, emoji, remind_time, monthly_goal)
+        )
+        await db.commit()
+
+
 async def get_today_completions(user_id: int) -> set:
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -348,14 +360,15 @@ async def get_user_achievements(user_id: int) -> list:
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Привычки"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="🏆 Рейтинг"), KeyboardButton(text="👤 Мой профиль")],
-            [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="⚙️ Управление")],
-        ],
-        resize_keyboard=True
-    )
+    rows = []
+    if WEBAPP_URL:
+        rows.append([KeyboardButton(text="✨ Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))])
+    rows += [
+        [KeyboardButton(text="📋 Привычки"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🏆 Рейтинг"), KeyboardButton(text="👤 Мой профиль")],
+        [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="⚙️ Управление")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -1221,6 +1234,35 @@ async def check_reminders():
 async def main():
     await init_db()
     asyncio.create_task(check_reminders())
+
+    # Start Mini App web server
+    try:
+        from webapp_server import run_webapp
+        import os as _os
+        port = int(_os.getenv("PORT", "8080"))
+        db_helpers = {
+            "get_habits": get_habits,
+            "create_habit": create_habit,
+            "get_today_completions": get_today_completions,
+            "toggle_completion": toggle_completion,
+            "get_streak": get_streak,
+            "get_best_streak": get_best_streak,
+            "get_monthly_stats": get_monthly_stats,
+            "get_week_completions": get_week_completions,
+            "check_and_grant_achievements": check_and_grant_achievements,
+            "get_user_xp": get_user_xp,
+            "add_xp": add_xp,
+            "get_level": get_level,
+            "get_leaderboard": get_leaderboard,
+            "get_user_rank": get_user_rank,
+            "ensure_user": ensure_user,
+            "LEVELS": LEVELS,
+        }
+        await run_webapp(BOT_TOKEN, db_helpers, port=port)
+        logger.info("Mini app web server started")
+    except Exception as e:
+        logger.warning(f"Mini app server failed to start: {e}")
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
