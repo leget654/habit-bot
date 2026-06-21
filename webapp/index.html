@@ -226,6 +226,11 @@ if (tg) { tg.ready(); tg.expand(); }
 
 const API_BASE = window.location.origin;
 const initData = tg?.initData || '';
+console.log('Telegram WebApp available:', !!tg);
+console.log('initData length:', initData.length);
+if (!initData) {
+  document.getElementById('headerSubtitle').textContent = '⚠️ Открой через кнопку в боте, не в браузере';
+}
 
 let state = {
   habits: [],
@@ -405,7 +410,23 @@ async function submitNewHabit() {
   }
 }
 
-// Init
+// Init - show visible debug info on screen since console isn't accessible on mobile
+function showDebug(msg) {
+  let el = document.getElementById('debugPanel');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'debugPanel';
+    el.style = 'position:fixed;top:0;left:0;right:0;background:#400;color:#fff;font-size:11px;padding:8px;z-index:999;max-height:140px;overflow:auto;font-family:monospace';
+    document.body.appendChild(el);
+  }
+  el.innerHTML += msg + '<br>';
+}
+
+showDebug(`tg exists: ${!!tg}`);
+showDebug(`tg.initData: "${tg?.initData || ''}" (len=${(tg?.initData||'').length})`);
+showDebug(`tg.initDataUnsafe: ${JSON.stringify(tg?.initDataUnsafe || {})}`);
+showDebug(`platform: ${tg?.platform}, version: ${tg?.version}`);
+
 loadHabits();
 </script>
 
