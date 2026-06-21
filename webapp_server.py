@@ -17,20 +17,25 @@ logger = logging.getLogger(__name__)
 def validate_init_data(init_data: str, bot_token: str) -> dict | None:
     """Validate Telegram WebApp initData signature. Returns parsed user dict or None."""
     if not init_data:
+        logger.warning("validate_init_data: empty init_data received")
         return None
     try:
-        parsed = dict(parse_qsl(init_data))
+        # keep_blank_values + do not over-decode: parse_qsl already decodes once correctly
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
         hash_received = parsed.pop("hash", None)
         if not hash_received:
+            logger.warning(f"validate_init_data: no hash in parsed data, keys={list(parsed.keys())}")
             return None
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
         secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
         computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if computed_hash != hash_received:
+            logger.warning(f"validate_init_data: hash mismatch. computed={computed_hash[:10]}... received={hash_received[:10]}... data_check_string={data_check_string[:200]}")
             return None
         user_json = parsed.get("user")
         if user_json:
             return json.loads(user_json)
+        logger.warning("validate_init_data: hash OK but no user field")
         return None
     except Exception as e:
         logger.warning(f"initData validation failed: {e}")
@@ -49,6 +54,7 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
 
     def get_user_id(request) -> int | None:
         init_data = request.headers.get("X-Telegram-Init-Data", "")
+        logger.info(f"get_user_id: init_data length={len(init_data)}")
         user = validate_init_data(init_data, bot_token)
         if user:
             return user.get("id")
