@@ -2,59 +2,33 @@
 Web server providing REST API for the Telegram Mini App.
 Validates Telegram WebApp initData and serves habit data.
 """
-import hashlib
-import hmac
 import json
 import logging
 from datetime import date, timedelta
-from urllib.parse import parse_qsl, unquote
 
 from aiohttp import web
+from init_data_py import InitData
 
 logger = logging.getLogger(__name__)
 
 
 def validate_init_data(init_data: str, bot_token: str) -> dict | None:
-    """Validate Telegram WebApp initData signature. Returns parsed user dict or None."""
+    """Validate Telegram WebApp initData signature using the init-data-py library.
+    Returns the parsed user dict, or None if invalid/missing.
+    """
     if not init_data:
         logger.warning("validate_init_data: empty init_data received")
         return None
     try:
-        logger.info(f"validate_init_data: RAW init_data={init_data!r}")
-        logger.info(f"validate_init_data: token fingerprint len={len(bot_token)} starts={bot_token[:6]!r} ends={bot_token[-4:]!r}")
-
-        # IMPORTANT: do not use parse_qsl's default '+' -> space conversion,
-        # since base64-like fields (hash, signature) can legitimately contain '+'.
-        pairs = [p.split("=", 1) for p in init_data.split("&") if "=" in p]
-        parsed = {k: unquote(v) for k, v in pairs}
-
-        hash_received = parsed.pop("hash", None)
-        # signature is a separate Ed25519 signature field added in newer clients;
-        # it must NOT be included in the data-check-string for the hash validation.
-        parsed.pop("signature", None)
-
-        if not hash_received:
-            logger.warning(f"validate_init_data: no hash in parsed data, keys={list(parsed.keys())}")
+        data = InitData.parse(init_data)
+        is_valid = data.validate(bot_token, lifetime=86400)
+        if not is_valid:
+            logger.warning("validate_init_data: signature invalid (library validate() returned False)")
             return None
-
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-
-        if computed_hash != hash_received:
-            logger.warning(
-                f"validate_init_data: hash mismatch.\n"
-                f"  computed={computed_hash}\n"
-                f"  received={hash_received}\n"
-                f"  data_check_string={data_check_string!r}"
-            )
+        if not data.user:
+            logger.warning("validate_init_data: signature OK but no user field")
             return None
-
-        user_json = parsed.get("user")
-        if user_json:
-            return json.loads(user_json)
-        logger.warning("validate_init_data: hash OK but no user field")
-        return None
+        return json.loads(data.user.to_json())
     except Exception as e:
         logger.warning(f"initData validation failed: {e}")
         return None
