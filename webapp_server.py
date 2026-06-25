@@ -20,6 +20,9 @@ def validate_init_data(init_data: str, bot_token: str) -> dict | None:
         logger.warning("validate_init_data: empty init_data received")
         return None
     try:
+        logger.info(f"validate_init_data: RAW init_data={init_data!r}")
+        logger.info(f"validate_init_data: token fingerprint len={len(bot_token)} starts={bot_token[:6]!r} ends={bot_token[-4:]!r}")
+
         # IMPORTANT: do not use parse_qsl's default '+' -> space conversion,
         # since base64-like fields (hash, signature) can legitimately contain '+'.
         pairs = [p.split("=", 1) for p in init_data.split("&") if "=" in p]
