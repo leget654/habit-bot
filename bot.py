@@ -79,6 +79,9 @@ def get_level(xp: int) -> tuple:
 class AddHabit(StatesGroup):
     waiting_name = State()
     waiting_emoji = State()
+    waiting_frequency = State()
+    waiting_specific_days = State()
+    waiting_times_per_week = State()
     waiting_time = State()
     waiting_goal = State()
 
@@ -149,6 +152,8 @@ async def init_db():
             ("users", "display_name", "TEXT"),
             ("users", "trial_started_at", "DATE DEFAULT NULL"),
             ("users", "premium_until", "DATE DEFAULT NULL"),
+            ("habits", "frequency_type", "TEXT DEFAULT 'daily'"),
+            ("habits", "frequency_data", "TEXT DEFAULT NULL"),
         ]
         for table, col, definition in migrations:
             try:
@@ -305,13 +310,76 @@ async def get_habits(user_id: int, include_paused: bool = False) -> list:
             return await cur.fetchall()
 
 
-async def create_habit(user_id: int, name: str, emoji: str = "✅", remind_time=None, monthly_goal=None):
-    """Simple habit creation used by the Mini App API."""
+async def create_habit(user_id: int, name: str, emoji: str = "✅", remind_time=None, monthly_goal=None,
+                        frequency_type: str = "daily", frequency_data=None):
+    """Habit creation used by the Mini App API and bot FSM.
+    frequency_type: 'daily' | 'times_per_week' | 'specific_days'
+    frequency_data: for 'times_per_week' -> str(int) e.g. "3"
+                     for 'specific_days' -> comma-separated weekday indices "0,2,4" (Mon=0)
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO habits (user_id, name, emoji, remind_time, monthly_goal) VALUES (?,?,?,?,?)",
-            (user_id, name, emoji, remind_time, monthly_goal)
+            "INSERT INTO habits (user_id, name, emoji, remind_time, monthly_goal, frequency_type, frequency_data) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user_id, name, emoji, remind_time, monthly_goal, frequency_type, frequency_data)
         )
+        await db.commit()
+
+
+def is_due_today(habit, today: date = None) -> bool:
+    """Whether a habit is scheduled for today based on its frequency."""
+    today = today or date.today()
+    freq_type = habit["frequency_type"] if habit["frequency_type"] else "daily"
+    if freq_type == "daily":
+        return True
+    if freq_type == "specific_days":
+        if not habit["frequency_data"]:
+            return True
+        days = {int(d) for d in habit["frequency_data"].split(",") if d != ""}
+        return today.weekday() in days
+    if freq_type == "times_per_week":
+        # "due" every day shown, but goal is N times that week - always show as available
+        return True
+    return True
+
+
+def frequency_label(habit) -> str:
+    freq_type = habit["frequency_type"] if habit["frequency_type"] else "daily"
+    if freq_type == "daily":
+        return "каждый день"
+    if freq_type == "times_per_week":
+        n = habit["frequency_data"] or "?"
+        return f"{n} раз{'а' if n not in ('1',) else ''} в неделю"
+    if freq_type == "specific_days":
+        names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        if not habit["frequency_data"]:
+            return "по дням"
+        days = sorted(int(d) for d in habit["frequency_data"].split(",") if d != "")
+        return ", ".join(names[d] for d in days)
+    return "каждый день"
+
+
+async def rename_habit(habit_id: int, new_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE habits SET name=? WHERE id=?", (new_name, habit_id))
+        await db.commit()
+
+
+async def set_habit_paused(habit_id: int, paused: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE habits SET is_paused=? WHERE id=?", (1 if paused else 0, habit_id))
+        await db.commit()
+
+
+async def delete_habit(habit_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE habits SET is_active=0 WHERE id=?", (habit_id,))
+        await db.commit()
+
+
+async def set_display_name(user_id: int, name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET display_name=? WHERE user_id=?", (name, user_id))
         await db.commit()
 
 
@@ -449,10 +517,7 @@ async def get_user_achievements(user_id: int) -> list:
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
-    rows = []
-    if WEBAPP_URL:
-        rows.append([KeyboardButton(text="✨ Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL))])
-    rows += [
+    rows = [
         [KeyboardButton(text="📋 Привычки"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="🏆 Рейтинг"), KeyboardButton(text="👤 Мой профиль")],
         [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="⚙️ Управление")],
@@ -491,8 +556,9 @@ async def today_kb(user_id: int) -> InlineKeyboardMarkup:
     buttons = []
     for h in habits:
         status = "✅" if h["id"] in done else "⬜"
+        due_mark = "" if is_due_today(h) else " 💤"
         buttons.append([InlineKeyboardButton(
-            text=f"{status} {h['emoji']} {h['name']}",
+            text=f"{status} {h['emoji']} {h['name']}{due_mark}",
             callback_data=f"toggle_{h['id']}"
         )])
     buttons.append([InlineKeyboardButton(text="🏠 Меню", callback_data="menu")])
@@ -905,12 +971,132 @@ async def fsm_emoji_cb(cb: CallbackQuery, state: FSMContext):
         await cb.answer("Сначала начни добавление привычки.", show_alert=True)
         return
     await state.update_data(emoji=cb.data.split("_", 1)[1])
-    await _ask_remind_time(cb.message, state)
+    await _ask_frequency(cb.message, state)
 
 @dp.message(AddHabit.waiting_emoji)
 async def fsm_emoji_text(msg: Message, state: FSMContext):
     await state.update_data(emoji=msg.text.strip())
-    await _ask_remind_time(msg, state)
+    await _ask_frequency(msg, state)
+
+
+async def _ask_frequency(target, state: FSMContext):
+    await state.set_state(AddHabit.waiting_frequency)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Каждый день", callback_data="freq_daily")],
+        [InlineKeyboardButton(text="🔢 N раз в неделю", callback_data="freq_times")],
+        [InlineKeyboardButton(text="🗓 Конкретные дни", callback_data="freq_days")],
+    ])
+    text = "📆 <b>Как часто выполнять?</b>"
+    if hasattr(target, 'message_id'):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "freq_daily")
+async def fsm_freq_daily(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_frequency.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    await state.update_data(frequency_type="daily", frequency_data=None)
+    await _ask_remind_time(cb.message, state)
+
+
+@dp.callback_query(F.data == "freq_times")
+async def fsm_freq_times(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_frequency.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    await state.set_state(AddHabit.waiting_times_per_week)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="2", callback_data="times_2"),
+         InlineKeyboardButton(text="3", callback_data="times_3"),
+         InlineKeyboardButton(text="4", callback_data="times_4")],
+        [InlineKeyboardButton(text="5", callback_data="times_5"),
+         InlineKeyboardButton(text="6", callback_data="times_6")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="freq_back")],
+    ])
+    await cb.message.edit_text("🔢 Сколько раз в неделю?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("times_"))
+async def fsm_times_pick(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_times_per_week.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    n = cb.data.split("_", 1)[1]
+    await state.update_data(frequency_type="times_per_week", frequency_data=n)
+    await _ask_remind_time(cb.message, state)
+
+
+@dp.callback_query(F.data == "freq_days")
+async def fsm_freq_days(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_frequency.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    await state.set_state(AddHabit.waiting_specific_days)
+    await state.update_data(selected_days=[])
+    await cb.message.edit_text("🗓 Выбери дни (можно несколько):", reply_markup=specific_days_kb([]))
+
+
+def specific_days_kb(selected: list) -> InlineKeyboardMarkup:
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    buttons = []
+    row = []
+    for i, name in enumerate(names):
+        mark = "✅ " if i in selected else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"day_{i}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="✔️ Готово", callback_data="days_done")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="freq_back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data.startswith("day_"))
+async def fsm_day_toggle(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_specific_days.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    day_idx = int(cb.data.split("_", 1)[1])
+    data = await state.get_data()
+    selected = data.get("selected_days", [])
+    if day_idx in selected:
+        selected.remove(day_idx)
+    else:
+        selected.append(day_idx)
+    await state.update_data(selected_days=selected)
+    await cb.message.edit_reply_markup(reply_markup=specific_days_kb(selected))
+
+
+@dp.callback_query(F.data == "days_done")
+async def fsm_days_done(cb: CallbackQuery, state: FSMContext):
+    current = await state.get_state()
+    if current != AddHabit.waiting_specific_days.state:
+        await cb.answer("Сначала начни добавление привычки.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = data.get("selected_days", [])
+    if not selected:
+        await cb.answer("Выбери хотя бы один день!", show_alert=True)
+        return
+    days_str = ",".join(str(d) for d in sorted(selected))
+    await state.update_data(frequency_type="specific_days", frequency_data=days_str)
+    await _ask_remind_time(cb.message, state)
+
+
+@dp.callback_query(F.data == "freq_back")
+async def fsm_freq_back(cb: CallbackQuery, state: FSMContext):
+    await _ask_frequency(cb.message, state)
+
 
 async def _ask_remind_time(target, state: FSMContext):
     await state.set_state(AddHabit.waiting_time)
@@ -990,20 +1176,24 @@ async def fsm_goal_text(msg: Message, state: FSMContext):
 async def _save_habit(source, state: FSMContext):
     data = await state.get_data()
     user_id = source.from_user.id
+    freq_type = data.get("frequency_type", "daily")
+    freq_data = data.get("frequency_data")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO habits (user_id, name, emoji, remind_time, monthly_goal) VALUES (?,?,?,?,?)",
-            (user_id, data["name"], data["emoji"], data.get("remind_time"), data.get("monthly_goal"))
+            "INSERT INTO habits (user_id, name, emoji, remind_time, monthly_goal, frequency_type, frequency_data) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user_id, data["name"], data["emoji"], data.get("remind_time"), data.get("monthly_goal"), freq_type, freq_data)
         )
         await db.commit()
     await state.clear()
     remind_text = f"⏰ {data.get('remind_time')}" if data.get("remind_time") else "🔕 Без напоминания"
     goal_text = f"🎯 Цель: {data['monthly_goal']} дней" if data.get("monthly_goal") else "🎯 Без цели"
+    freq_label = frequency_label({"frequency_type": freq_type, "frequency_data": freq_data})
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 К привычкам", callback_data="show_today")],
         [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="add_habit")],
     ])
-    text = f"✅ <b>Привычка добавлена!</b>\n\n{data['emoji']} {data['name']}\n{remind_text}\n{goal_text}"
+    text = f"✅ <b>Привычка добавлена!</b>\n\n{data['emoji']} {data['name']}\n📆 {freq_label}\n{remind_text}\n{goal_text}"
     if hasattr(source, 'message'):
         await source.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -1504,6 +1694,13 @@ async def main():
             "ensure_user": ensure_user,
             "can_add_habit": can_add_habit,
             "get_subscription_status": get_subscription_status,
+            "rename_habit": rename_habit,
+            "set_habit_paused": set_habit_paused,
+            "delete_habit": delete_habit,
+            "set_display_name": set_display_name,
+            "frequency_label": frequency_label,
+            "FREE_HABIT_LIMIT": FREE_HABIT_LIMIT,
+            "SUBSCRIPTION_STARS_PRICE": SUBSCRIPTION_STARS_PRICE,
             "LEVELS": LEVELS,
         }
         await run_webapp(BOT_TOKEN, db_helpers, port=port)
