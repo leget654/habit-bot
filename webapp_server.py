@@ -63,7 +63,7 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
         if not user_id:
             return web.json_response({"error": "unauthorized"}, status=401)
 
-        habits = await db_helpers["get_habits"](user_id)
+        habits = await db_helpers["get_habits"](user_id, include_paused=True)
         today_done = await db_helpers["get_today_completions"](user_id)
         today = date.today()
 
@@ -85,9 +85,16 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
                 "done_today": h["id"] in today_done,
                 "week": week_bools,
                 "goal_text": goal_text,
+                "is_paused": bool(h["is_paused"]),
+                "frequency_type": h["frequency_type"] or "daily",
+                "frequency_data": h["frequency_data"],
+                "frequency_label": db_helpers["frequency_label"](h),
+                "remind_time": h["remind_time"],
+                "monthly_goal": h["monthly_goal"],
             })
 
-        return web.json_response({"habits": result, "today_done": len(today_done)})
+        active_count = sum(1 for h in result if not h["is_paused"])
+        return web.json_response({"habits": result, "today_done": len(today_done), "active_count": active_count})
 
     async def handle_create_habit(request):
         user_id = get_user_id(request)
@@ -98,13 +105,51 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
         emoji = (body.get("emoji") or "✅").strip()[:8]
         if not name:
             return web.json_response({"error": "name required"}, status=400)
+        freq_type = body.get("frequency_type", "daily")
+        freq_data = body.get("frequency_data")
+        remind_time = body.get("remind_time")
+        monthly_goal = body.get("monthly_goal")
         await db_helpers["ensure_user"](user_id, body.get("first_name", "User"))
         if not await db_helpers["can_add_habit"](user_id):
             return web.json_response(
                 {"error": "limit_reached", "message": "Достигнут лимит привычек на бесплатном тарифе"},
                 status=403
             )
-        await db_helpers["create_habit"](user_id, name, emoji)
+        await db_helpers["create_habit"](
+            user_id, name, emoji,
+            remind_time=remind_time, monthly_goal=monthly_goal,
+            frequency_type=freq_type, frequency_data=freq_data
+        )
+        return web.json_response({"ok": True})
+
+    async def handle_rename_habit(request):
+        user_id = get_user_id(request)
+        if not user_id:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        habit_id = int(request.match_info["habit_id"])
+        body = await request.json()
+        name = (body.get("name") or "").strip()[:64]
+        if not name:
+            return web.json_response({"error": "name required"}, status=400)
+        await db_helpers["rename_habit"](habit_id, name)
+        return web.json_response({"ok": True})
+
+    async def handle_pause_habit(request):
+        user_id = get_user_id(request)
+        if not user_id:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        habit_id = int(request.match_info["habit_id"])
+        body = await request.json()
+        paused = bool(body.get("paused", True))
+        await db_helpers["set_habit_paused"](habit_id, paused)
+        return web.json_response({"ok": True})
+
+    async def handle_delete_habit(request):
+        user_id = get_user_id(request)
+        if not user_id:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        habit_id = int(request.match_info["habit_id"])
+        await db_helpers["delete_habit"](habit_id)
         return web.json_response({"ok": True})
 
     async def handle_toggle_habit(request):
@@ -202,12 +247,62 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
             "top": top,
         })
 
+    async def handle_profile(request):
+        user_id = get_user_id(request)
+        if not user_id:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        xp = await db_helpers["get_user_xp"](user_id)
+        rank = await db_helpers["get_user_rank"](user_id)
+        level_num, level_name, next_xp = db_helpers["get_level"](xp)
+        habits = await db_helpers["get_habits"](user_id, include_paused=True)
+        sub = await db_helpers["get_subscription_status"](user_id)
+
+        prev_xp = 0
+        for req, _ in db_helpers["LEVELS"]:
+            if req <= xp:
+                prev_xp = req
+        span = (next_xp - prev_xp) if next_xp else 1
+        progress_pct = round(((xp - prev_xp) / span) * 100) if next_xp else 100
+
+        sub_info = {
+            "is_premium": sub["is_premium"],
+            "is_trial": sub["is_trial"],
+            "trial_days_left": sub["trial_days_left"],
+            "premium_until": sub["premium_until"].isoformat() if sub["premium_until"] else None,
+            "free_limit": db_helpers["FREE_HABIT_LIMIT"],
+            "stars_price": db_helpers["SUBSCRIPTION_STARS_PRICE"],
+        }
+
+        return web.json_response({
+            "xp": xp, "rank": rank, "level_num": level_num, "level_name": level_name,
+            "next_xp": next_xp, "progress_pct": progress_pct,
+            "habits_count": len(habits),
+            "subscription": sub_info,
+        })
+
+    async def handle_set_username(request):
+        user_id = get_user_id(request)
+        if not user_id:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        body = await request.json()
+        name = (body.get("name") or "").strip()[:32]
+        if not name:
+            return web.json_response({"error": "name required"}, status=400)
+        await db_helpers["set_display_name"](user_id, name)
+        return web.json_response({"ok": True})
+
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/habits", handle_get_habits)
     app.router.add_post("/api/habits", handle_create_habit)
     app.router.add_post("/api/habits/{habit_id}/toggle", handle_toggle_habit)
+    app.router.add_post("/api/habits/{habit_id}/rename", handle_rename_habit)
+    app.router.add_post("/api/habits/{habit_id}/pause", handle_pause_habit)
+    app.router.add_post("/api/habits/{habit_id}/delete", handle_delete_habit)
     app.router.add_get("/api/stats", handle_stats)
     app.router.add_get("/api/leaderboard", handle_leaderboard)
+    app.router.add_get("/api/profile", handle_profile)
+    app.router.add_post("/api/profile/username", handle_set_username)
     app.router.add_static("/static", "webapp", show_index=False)
 
     return app
