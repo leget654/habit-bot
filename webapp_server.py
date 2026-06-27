@@ -99,6 +99,11 @@ def make_app(bot_token: str, db_helpers: dict, dev_mode: bool = False):
         if not name:
             return web.json_response({"error": "name required"}, status=400)
         await db_helpers["ensure_user"](user_id, body.get("first_name", "User"))
+        if not await db_helpers["can_add_habit"](user_id):
+            return web.json_response(
+                {"error": "limit_reached", "message": "Достигнут лимит привычек на бесплатном тарифе"},
+                status=403
+            )
         await db_helpers["create_habit"](user_id, name, emoji)
         return web.json_response({"ok": True})
 
