@@ -8,7 +8,7 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    WebAppInfo
+    WebAppInfo, LabeledPrice, PreCheckoutQuery
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -147,6 +147,8 @@ async def init_db():
             ("completions", "note", "TEXT DEFAULT NULL"),
             ("users", "total_xp", "INTEGER DEFAULT 0"),
             ("users", "display_name", "TEXT"),
+            ("users", "trial_started_at", "DATE DEFAULT NULL"),
+            ("users", "premium_until", "DATE DEFAULT NULL"),
         ]
         for table, col, definition in migrations:
             try:
@@ -157,6 +159,86 @@ async def init_db():
         await db.commit()
 
 
+# ── Subscription ──────────────────────────────────────────────────────────────
+
+FREE_HABIT_LIMIT = 3
+TRIAL_DAYS = 3
+SUBSCRIPTION_STARS_PRICE = 99  # Telegram Stars, ~ a couple dollars
+SUBSCRIPTION_DAYS = 30
+
+
+async def get_subscription_status(user_id: int) -> dict:
+    """Returns dict with: is_premium, is_trial, trial_days_left, premium_until"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT trial_started_at, premium_until FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        return {"is_premium": False, "is_trial": False, "trial_days_left": 0, "premium_until": None}
+
+    today = date.today()
+
+    # Active paid subscription
+    if row["premium_until"]:
+        premium_until = date.fromisoformat(row["premium_until"])
+        if premium_until >= today:
+            return {"is_premium": True, "is_trial": False, "trial_days_left": 0, "premium_until": premium_until}
+
+    # Trial period
+    if row["trial_started_at"]:
+        trial_start = date.fromisoformat(row["trial_started_at"])
+        trial_end = trial_start + timedelta(days=TRIAL_DAYS - 1)  # inclusive end day
+        days_left = (trial_end - today).days
+        if days_left >= 0:
+            return {"is_premium": True, "is_trial": True, "trial_days_left": days_left + 1, "premium_until": None}
+
+    return {"is_premium": False, "is_trial": False, "trial_days_left": 0, "premium_until": None}
+
+
+async def start_trial_if_new(user_id: int):
+    """Starts the 3-day trial the first time a user is seen, if they never had one."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT trial_started_at, premium_until FROM users WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row and row[0] is None and row[1] is None:
+            await db.execute(
+                "UPDATE users SET trial_started_at=? WHERE user_id=?",
+                (date.today().isoformat(), user_id)
+            )
+            await db.commit()
+
+
+async def grant_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        today = date.today()
+        current_until = date.fromisoformat(row[0]) if row and row[0] else today
+        base = max(current_until, today)
+        new_until = base + timedelta(days=days)
+        await db.execute(
+            "UPDATE users SET premium_until=? WHERE user_id=?",
+            (new_until.isoformat(), user_id)
+        )
+        await db.commit()
+        return new_until
+
+
+async def can_add_habit(user_id: int) -> bool:
+    status = await get_subscription_status(user_id)
+    if status["is_premium"]:
+        return True
+    habits = await get_habits(user_id, include_paused=True)
+    return len(habits) < FREE_HABIT_LIMIT
+
+
 async def ensure_user(user_id: int, first_name: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -164,6 +246,13 @@ async def ensure_user(user_id: int, first_name: str):
             (user_id, first_name)
         )
         await db.commit()
+    await start_trial_if_new(user_id)
+
+
+async def user_exists(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)) as cur:
+            return (await cur.fetchone()) is not None
 
 
 async def add_xp(user_id: int, amount: int) -> int:
@@ -367,6 +456,7 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📋 Привычки"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="🏆 Рейтинг"), KeyboardButton(text="👤 Мой профиль")],
         [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="⚙️ Управление")],
+        [KeyboardButton(text="✨ Premium")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
@@ -379,6 +469,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 История за неделю", callback_data="show_week")],
         [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="show_profile")],
+        [InlineKeyboardButton(text="✨ Premium", callback_data="show_premium")],
         [InlineKeyboardButton(text="⚙️ Управление", callback_data="show_manage")],
     ])
 
@@ -481,13 +572,26 @@ def rank_medal(rank: int) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
+    is_new = not await user_exists(msg.from_user.id)
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
-    await msg.answer(
-        f"Привет, {msg.from_user.first_name}! 👋\n\n"
-        "Отслеживай привычки, зарабатывай опыт ⚡ и поднимайся в рейтинге 🏆\n\n"
-        "Используй кнопки внизу 👇",
-        reply_markup=main_reply_kb()
-    )
+
+    if is_new:
+        await msg.answer(
+            f"Привет, {msg.from_user.first_name}! 👋\n\n"
+            "Отслеживай привычки, зарабатывай опыт ⚡ и поднимайся в рейтинге 🏆\n\n"
+            f"🎁 Тебе доступен бесплатный <b>пробный период {TRIAL_DAYS} дня</b> — "
+            "все функции открыты без ограничений!\n\n"
+            "Используй кнопки внизу 👇",
+            parse_mode="HTML",
+            reply_markup=main_reply_kb()
+        )
+    else:
+        await msg.answer(
+            f"Привет, {msg.from_user.first_name}! 👋\n\n"
+            "Отслеживай привычки, зарабатывай опыт ⚡ и поднимайся в рейтинге 🏆\n\n"
+            "Используй кнопки внизу 👇",
+            reply_markup=main_reply_kb()
+        )
 
 @dp.message(Command("menu"))
 async def cmd_menu_msg(msg: Message):
@@ -497,6 +601,86 @@ async def cmd_menu_msg(msg: Message):
 async def cmd_reset(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Готово! Можешь пользоваться ботом.", reply_markup=main_reply_kb())
+
+@dp.message(Command("premium"))
+async def cmd_premium(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await send_premium_screen(msg.from_user.id, msg)
+
+@dp.callback_query(F.data == "show_premium")
+async def cb_show_premium(cb: CallbackQuery):
+    await send_premium_screen(cb.from_user.id, cb.message)
+
+
+async def send_premium_screen(user_id: int, target):
+    status = await get_subscription_status(user_id)
+
+    if status["is_premium"] and not status["is_trial"]:
+        text = (
+            f"✨ <b>У тебя активна подписка</b>\n\n"
+            f"Действует до: {status['premium_until'].strftime('%d.%m.%Y')}\n\n"
+            f"Безлимитные привычки, рейтинг, мини-приложение — всё открыто."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Продлить ещё на 30 дней", callback_data="buy_premium")],
+        ])
+    elif status["is_trial"]:
+        text = (
+            f"🎁 <b>Пробный период активен</b>\n\n"
+            f"Осталось дней: {status['trial_days_left']}\n\n"
+            f"Сейчас доступны все функции бесплатно. После окончания пробного периода "
+            f"бесплатно останется {FREE_HABIT_LIMIT} привычки — для безлимита оформи подписку."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✨ Подписка — {SUBSCRIPTION_STARS_PRICE}⭐/мес", callback_data="buy_premium")],
+        ])
+    else:
+        text = (
+            f"✨ <b>Premium подписка</b>\n\n"
+            f"• Безлимитные привычки (сейчас доступно {FREE_HABIT_LIMIT})\n"
+            f"• Рейтинг и достижения\n"
+            f"• Мини-приложение с красивыми карточками\n"
+            f"• Расширенная статистика\n\n"
+            f"Цена: <b>{SUBSCRIPTION_STARS_PRICE} ⭐ Stars</b> за 30 дней"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✨ Оформить за {SUBSCRIPTION_STARS_PRICE}⭐", callback_data="buy_premium")],
+        ])
+
+    if hasattr(target, 'message_id'):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_premium(cb: CallbackQuery):
+    await bot.send_invoice(
+        chat_id=cb.from_user.id,
+        title="Premium подписка — 30 дней",
+        description="Безлимитные привычки, рейтинг, достижения и мини-приложение",
+        payload=f"premium_30d_{cb.from_user.id}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Premium 30 дней", amount=SUBSCRIPTION_STARS_PRICE)],
+    )
+    await cb.answer()
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(msg: Message):
+    new_until = await grant_subscription(msg.from_user.id, SUBSCRIPTION_DAYS)
+    await msg.answer(
+        f"🎉 <b>Спасибо за подписку!</b>\n\n"
+        f"Premium активен до: {new_until.strftime('%d.%m.%Y')}\n\n"
+        f"Теперь у тебя безлимитные привычки и доступ ко всем функциям!",
+        parse_mode="HTML",
+        reply_markup=main_reply_kb()
+    )
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery):
@@ -541,15 +725,38 @@ async def reply_profile(msg: Message):
 @dp.message(F.text == "➕ Добавить")
 async def reply_add(msg: Message, state: FSMContext):
     await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    if not await can_add_habit(msg.from_user.id):
+        await send_limit_reached(msg.from_user.id, msg)
+        return
     await state.set_state(AddHabit.waiting_name)
     await msg.answer(
         "➕ <b>Новая привычка</b>\n\nКак называется?\n<i>Например: Зарядка, Читать, Пить воду</i>",
         parse_mode="HTML"
     )
 
+
+async def send_limit_reached(user_id: int, target):
+    text = (
+        f"🔒 <b>Достигнут лимит привычек</b>\n\n"
+        f"На бесплатном тарифе доступно до {FREE_HABIT_LIMIT} привычек.\n"
+        f"Оформи Premium подписку для безлимита!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Узнать про Premium", callback_data="show_premium")],
+    ])
+    if hasattr(target, 'message_id'):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
 @dp.message(F.text == "⚙️ Управление")
 async def reply_manage(msg: Message):
     await msg.answer("⚙️ <b>Управление</b>", reply_markup=manage_kb(), parse_mode="HTML")
+
+@dp.message(F.text == "✨ Premium")
+async def reply_premium(msg: Message):
+    await ensure_user(msg.from_user.id, msg.from_user.first_name)
+    await send_premium_screen(msg.from_user.id, msg)
 
 
 # ── Today / toggle ────────────────────────────────────────────────────────────
@@ -664,6 +871,9 @@ async def fsm_note(msg: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_habit")
 async def cb_add_habit(cb: CallbackQuery, state: FSMContext):
+    if not await can_add_habit(cb.from_user.id):
+        await send_limit_reached(cb.from_user.id, cb.message)
+        return
     await state.set_state(AddHabit.waiting_name)
     await cb.message.edit_text(
         "➕ <b>Новая привычка</b>\n\nКак называется?\n<i>Например: Зарядка, Читать, Пить воду</i>",
@@ -809,8 +1019,16 @@ async def _send_profile(user_id: int, target):
     bar = xp_bar(xp, next_xp)
     achs = await get_user_achievements(user_id)
     habits = await get_habits(user_id)
+    sub_status = await get_subscription_status(user_id)
 
     next_text = f"{next_xp - xp} ⚡ до следующего уровня" if next_xp else "Максимальный уровень!"
+
+    if sub_status["is_premium"] and sub_status["is_trial"]:
+        sub_line = f"🎁 Пробный период · осталось {sub_status['trial_days_left']} дн."
+    elif sub_status["is_premium"]:
+        sub_line = f"✨ Premium до {sub_status['premium_until'].strftime('%d.%m.%Y')}"
+    else:
+        sub_line = f"🔒 Бесплатный тариф · до {FREE_HABIT_LIMIT} привычек"
 
     lines = [
         f"👤 <b>Мой профиль</b>\n",
@@ -819,9 +1037,11 @@ async def _send_profile(user_id: int, target):
         f"<code>{bar}</code>  {next_text}\n",
         f"📌 Привычек: {len(habits)}",
         f"🏅 Достижений: {len(achs)}",
+        f"\n{sub_line}",
     ]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Premium", callback_data="show_premium")],
         [InlineKeyboardButton(text="✏️ Изменить имя в рейтинге", callback_data="set_username")],
         [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="show_leaderboard")],
         [InlineKeyboardButton(text="🏅 Достижения", callback_data="show_achievements")],
@@ -1226,6 +1446,32 @@ async def check_reminders():
                     users = [r[0] for r in await cur.fetchall()]
             for uid in users:
                 await send_weekly_report(uid)
+
+        # Trial ending reminder, once a day at 12:00
+        if now_str == "12:00":
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT user_id, trial_started_at FROM users WHERE trial_started_at IS NOT NULL AND premium_until IS NULL"
+                ) as cur:
+                    trial_users = await cur.fetchall()
+            for row in trial_users:
+                status = await get_subscription_status(row["user_id"])
+                if status["is_trial"] and status["trial_days_left"] == 1:
+                    try:
+                        await bot.send_message(
+                            row["user_id"],
+                            f"⏳ <b>Пробный период заканчивается завтра!</b>\n\n"
+                            f"После этого бесплатно останется {FREE_HABIT_LIMIT} привычки. "
+                            f"Оформи Premium чтобы сохранить безлимит.",
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="✨ Узнать про Premium", callback_data="show_premium")]
+                            ])
+                        )
+                    except Exception as e:
+                        logger.warning(f"Trial reminder failed for {row['user_id']}: {e}")
+
         await asyncio.sleep(60)
 
 
@@ -1256,6 +1502,8 @@ async def main():
             "get_leaderboard": get_leaderboard,
             "get_user_rank": get_user_rank,
             "ensure_user": ensure_user,
+            "can_add_habit": can_add_habit,
+            "get_subscription_status": get_subscription_status,
             "LEVELS": LEVELS,
         }
         await run_webapp(BOT_TOKEN, db_helpers, port=port)
